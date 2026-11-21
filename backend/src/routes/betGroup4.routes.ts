@@ -15,6 +15,9 @@ import { validateBody, validateParams, validateQuery } from '../api/middleware/v
 import { rateLimit } from '../middleware/rate-limit.middleware';
 import { AppError } from '../utils/AppError';
 import { pool } from '../config/db';
+import { ERROR_CODES } from '../constants/errorCodes';
+import { buildPaginationMeta } from '../utils/pagination';
+import { getMarketUpdatePublisher } from '../services/marketUpdatePublisher.service';
 
 const router = Router();
 
@@ -77,6 +80,14 @@ router.post(
       }
 
       const betAmountBig = BigInt(amount);
+      const minBetAmountBig = BigInt(market.min_bet_amount ?? '1000000');
+      if (betAmountBig < minBetAmountBig) {
+        throw AppError.badRequest(
+          `Bet amount must be at least ${minBetAmountBig} stroops`,
+          ERROR_CODES.BET_BELOW_MINIMUM,
+        );
+      }
+
       const totalPoolBig = BigInt(market.total_pool ?? '0');
       const sidePoolCol = side === 'fighter_a' ? 'pool_a' : side === 'fighter_b' ? 'pool_b' : 'pool_draw';
       const currentSidePoolBig = BigInt(market[sidePoolCol] ?? '0');
@@ -99,12 +110,13 @@ router.post(
       }
 
       const txHash = idempotency_key ? `tx_${idempotency_key}` : `tx_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+      const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 
       const betInsertRes = await client.query(
         `INSERT INTO bets (
           market_id, bettor_address, side, amount, amount_xlm,
-          tx_hash, ledger_sequence, placed_at, claimed
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), false)
+          expires_at, tx_hash, ledger_sequence, placed_at, claimed
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), false)
         RETURNING *`,
         [
           market_id,
@@ -112,6 +124,7 @@ router.post(
           side,
           amount,
           Number(amount) / 10_000_000,
+          expiresAt,
           txHash,
           1000,
         ]
@@ -127,6 +140,21 @@ router.post(
       );
 
       await client.query('COMMIT');
+
+      // Publish real-time market update to WebSocket subscribers
+      const publisher = getMarketUpdatePublisher();
+      const newSidePool = String(BigInt(market[sidePoolCol] ?? '0') + betAmountBig);
+      const newTotalPool = String(BigInt(market.total_pool ?? '0') + betAmountBig);
+      const updateData: Record<string, unknown> = {
+        [sidePoolCol]: newSidePool,
+        total_pool: newTotalPool,
+        volume: Number(newTotalPool) / 10_000_000,
+        num_bets: (market.num_bets ?? 0) + 1,
+      };
+      publisher.publishPoolUpdate(market_id, {
+        [`pool_${side === 'fighter_a' ? 'a' : side === 'fighter_b' ? 'b' : 'draw'}`]: Number(newSidePool),
+      });
+      publisher.publishUpdate(market_id, 'volume_updated', updateData);
 
       res.status(201).json({
         success: true,
@@ -232,12 +260,7 @@ router.get(
         success: true,
         data: {
           bets: betsRes.rows,
-          pagination: {
-            page,
-            limit,
-            total,
-            totalPages: Math.ceil(total / limit) || 1,
-          },
+          meta: buildPaginationMeta(total, page, limit),
         },
       });
     } catch (err) {

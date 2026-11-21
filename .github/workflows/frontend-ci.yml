@@ -115,3 +115,14 @@ jobs:
           name: playwright-traces
           path: frontend/test-results/
           retention-days: 7
+
+      - name: Upload visual diff artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-regression-diffs
+          path: |
+            frontend/test-results/**/*.png
+            frontend/test-results/**/*.zip
+          if-no-files-found: ignore
+          retention-days: 7

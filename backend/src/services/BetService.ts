@@ -8,7 +8,7 @@ import { pool } from '../config/db';
 import { cacheDelete, cacheDeletePattern } from './cache.service';
 import { AppError } from '../utils/AppError';
 import { Address, xdr } from '@stellar/stellar-sdk';
-import { invokeContract } from './StellarService';
+import { invokeContractProtected } from './StellarService';
 
 export interface BetWithMarket extends Bet {
   market_id: string;
@@ -27,6 +27,29 @@ export interface ProjectedPayout {
   formatted_xlm: number;
 }
 
+export function toPredictionExpiration(expires_at?: Date | string | null): Date | null {
+  if (!expires_at) {
+    return null;
+  }
+
+  const value = expires_at instanceof Date ? expires_at : new Date(expires_at);
+  return Number.isNaN(value.getTime()) ? null : value;
+}
+
+export function isPredictionExpired(
+  expires_at?: Date | string | null,
+  now: Date = new Date(),
+): boolean {
+  const expiry = toPredictionExpiration(expires_at);
+  return expiry !== null && expiry.getTime() <= now.getTime();
+}
+
+export function validatePredictionExpiration(expires_at?: Date | string | null): void {
+  if (isPredictionExpired(expires_at)) {
+    throw AppError.badRequest('Prediction has expired');
+  }
+}
+
 /**
  * Records a bet triggered by a BetPlaced blockchain event.
  * 
@@ -43,6 +66,7 @@ export async function recordBet(
   amount: string,
   tx_hash: string,
   ledger_sequence: number,
+  expires_at?: Date | string | null,
 ): Promise<Bet> {
   if (!market_id || !bettor_address || !side || !amount || !tx_hash) {
     throw AppError.badRequest('Missing required bet fields');
@@ -54,6 +78,8 @@ export async function recordBet(
   }
 
   const amount_xlm = Number(amount) / 10_000_000;
+  const normalizedExpiry = toPredictionExpiration(expires_at) ?? new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+  validatePredictionExpiration(normalizedExpiry);
 
   const client = await pool.connect();
   let bet: any;
@@ -62,11 +88,11 @@ export async function recordBet(
     await client.query('BEGIN');
 
     const result = await client.query(
-      `INSERT INTO bets (market_id, bettor_address, side, amount, amount_xlm, tx_hash, ledger_sequence)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `INSERT INTO bets (market_id, bettor_address, side, amount, amount_xlm, expires_at, tx_hash, ledger_sequence)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        ON CONFLICT (tx_hash) DO NOTHING
        RETURNING *`,
-      [market_id, bettor_address, side, amount, amount_xlm, tx_hash, ledger_sequence],
+      [market_id, bettor_address, side, amount, amount_xlm, normalizedExpiry, tx_hash, ledger_sequence],
     );
 
     if (result.rows.length > 0) {
@@ -178,7 +204,7 @@ export async function calculateProjectedPayout(
 
   // Fetch market
   const marketResult = await pool.query(
-    'SELECT * FROM markets WHERE market_id = $1',
+    'SELECT * FROM markets WHERE market_id = $1 AND deleted_at IS NULL',
     [market_id],
   );
 
@@ -271,7 +297,7 @@ export async function claimWinnings(
   const bettorScVal = Address.fromString(bettor_address).toScVal();
   const tokenScVal = Address.fromString(token_address).toScVal();
 
-  const tx_hash = await invokeContract(contract_address, 'claim_winnings', [bettorScVal, tokenScVal]);
+  const tx_hash = await invokeContractProtected(contract_address, 'claim_winnings', [bettorScVal, tokenScVal]);
 
   return tx_hash;
 }
@@ -308,7 +334,7 @@ export async function claimRefund(
   const bettorScVal = Address.fromString(bettor_address).toScVal();
   const tokenScVal = Address.fromString(token_address).toScVal();
 
-  const tx_hash = await invokeContract(contract_address, 'claim_refund', [bettorScVal, tokenScVal]);
+  const tx_hash = await invokeContractProtected(contract_address, 'claim_refund', [bettorScVal, tokenScVal]);
 
   return tx_hash;
 }
@@ -373,7 +399,7 @@ export async function processMarketRefunds(
       try {
         const bettorScVal = Address.fromString(bettor_address).toScVal();
         const tokenScVal = Address.fromString(token_address).toScVal();
-        await invokeContract(contract_address, 'claim_refund', [bettorScVal, tokenScVal]);
+        await invokeContractProtected(contract_address, 'claim_refund', [bettorScVal, tokenScVal]);
         result.submitted++;
       } catch {
         // Expected — claim_refund requires bettor.require_auth();

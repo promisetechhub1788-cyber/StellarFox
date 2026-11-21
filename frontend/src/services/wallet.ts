@@ -6,7 +6,7 @@
 import {
   Contract,
   Networks,
-  SorobanRpc,
+  rpc,
   TransactionBuilder,
   BASE_FEE,
   nativeToScVal,
@@ -93,7 +93,7 @@ async function buildAndSubmitWithStages(
   const address = getConnectedAddress();
   if (!address) throw new Error('WalletNotConnected');
 
-  const server = new SorobanRpc.Server(SOROBAN_RPC_URL);
+  const server = new rpc.Server(SOROBAN_RPC_URL);
   const account = await server.getAccount(address);
   const contract = new Contract(contractAddress);
 
@@ -313,7 +313,7 @@ export async function submitClaimWithStages(
   const token = process.env.NEXT_PUBLIC_XLM_TOKEN_ADDRESS;
   if (!token) throw new Error('NEXT_PUBLIC_XLM_TOKEN_ADDRESS not set');
 
-  const server = new SorobanRpc.Server(SOROBAN_RPC_URL);
+  const server = new rpc.Server(SOROBAN_RPC_URL);
   const account = await server.getAccount(address);
   const contract = new Contract(market_contract_address);
 

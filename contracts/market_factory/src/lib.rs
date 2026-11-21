@@ -29,6 +29,7 @@ const OPEN_MARKETS: &str = "OPEN_MARKETS";
 
 #[contractclient(name = "MarketClient")]
 pub trait MarketInterface {
+    /// Initializes a newly deployed market with its factory-provided settings.
     fn initialize(
         env: Env,
         factory: Address,
@@ -37,8 +38,14 @@ pub trait MarketInterface {
         config: MarketConfig,
         treasury: Address,
     ) -> Result<(), ContractError>;
+
+    /// Returns a bettor's recorded bets for this market.
     fn get_bets_by_address(env: Env, bettor: Address) -> Vec<BetRecord>;
+
+    /// Returns the complete state of this market.
     fn get_state(env: Env) -> Result<MarketState, ContractError>;
+
+    /// Replaces this market's Wasm after authorization by the factory admin.
     fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), ContractError>;
 }
 
@@ -106,6 +113,8 @@ impl MarketFactory {
             lock_before_secs: config.default_lock_before_secs,
             resolution_window: config.default_resolution_window,
             tier: 0,
+            dispute_cooldown_ledgers: 0,
+            token_decimals: 7,
         };
         env.storage()
             .persistent()
@@ -137,6 +146,7 @@ impl MarketFactory {
         env.storage()
             .persistent()
             .set(&MARKET_WASM_HASH, &new_wasm_hash);
+        boxmeout_shared::emit_market_wasm_updated(&env, admin, new_wasm_hash);
         Ok(())
     }
 
@@ -173,6 +183,9 @@ impl MarketFactory {
         }
         if config.max_bet < config.min_bet_amount {
             return Err(ContractError::InvalidMarketParameters);
+        }
+        if config.token_decimals > boxmeout_shared::math::MAX_TOKEN_DECIMALS {
+            return Err(ContractError::InvalidTokenPrecision);
         }
         // Tier 0 = untiered/default; any positive u32 is valid (e.g. 18, 20, etc.)
         // No upper bound enforced — factory admin is responsible for tier assignments.
@@ -418,8 +431,9 @@ impl MarketFactory {
             .persistent()
             .get(&ORACLE_WHITELIST)
             .unwrap_or_else(|| Map::new(&env));
-        oracles.set(oracle, raw_key);
+        oracles.set(oracle.clone(), raw_key);
         env.storage().persistent().set(&ORACLE_WHITELIST, &oracles);
+        boxmeout_shared::emit_oracle_added(&env, admin, oracle);
         Ok(())
     }
 
@@ -440,8 +454,9 @@ impl MarketFactory {
         if !oracles.contains_key(oracle.clone()) {
             return Err(ContractError::OracleNotWhitelisted);
         }
-        oracles.remove(oracle);
+        oracles.remove(oracle.clone());
         env.storage().persistent().set(&ORACLE_WHITELIST, &oracles);
+        boxmeout_shared::emit_oracle_removed(&env, admin, oracle);
         Ok(())
     }
 
@@ -553,6 +568,7 @@ impl MarketFactory {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         env.storage().persistent().set(&PAUSED, &true);
+        boxmeout_shared::emit_factory_paused(&env, admin);
         Ok(())
     }
 
@@ -564,6 +580,7 @@ impl MarketFactory {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         env.storage().persistent().set(&PAUSED, &false);
+        boxmeout_shared::emit_factory_unpaused(&env, admin);
         Ok(())
     }
 
@@ -651,6 +668,14 @@ impl MarketFactory {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         env.storage().persistent().set(&DEFAULT_CONFIG, &new_config);
+        boxmeout_shared::emit_default_config_updated(
+            &env,
+            new_config.min_bet_amount,
+            new_config.max_bet,
+            new_config.fee_bps,
+            new_config.lock_before_secs,
+            new_config.resolution_window,
+        );
         Ok(())
     }
 
@@ -755,7 +780,6 @@ mod tests {
             default_fee_bps: 200,
             default_lock_before_secs: 3600,
             default_resolution_window: 86400,
-            tier: 0,
         }
     }
 
@@ -779,6 +803,8 @@ mod tests {
             lock_before_secs: 3600,
             resolution_window: 86400,
             tier: 0,
+            dispute_cooldown_ledgers: 0,
+            token_decimals: 7,
         }
     }
 
@@ -1007,6 +1033,9 @@ mod scheduled_at_validation_tests {
             fee_bps: 200,
             lock_before_secs: 3600,
             resolution_window: 86400,
+            tier: 0,
+            dispute_cooldown_ledgers: 0,
+            token_decimals: 7,
         }
     }
 
@@ -1194,7 +1223,6 @@ mod open_markets_cleanup_tests {
             default_fee_bps: 200,
             default_lock_before_secs: 3_600,
             default_resolution_window: 86_400,
-            tier: 0,
         });
 
         client.initialize(
@@ -1537,6 +1565,9 @@ mod task12_factory_market_integrity_tests {
             fee_bps: 200,
             lock_before_secs: 3_600,
             resolution_window: 86_400,
+            tier: 0,
+            dispute_cooldown_ledgers: 0,
+            token_decimals: 7,
         };
 
         // 1. Fight scheduled in the past
@@ -1583,5 +1614,338 @@ mod task12_factory_market_integrity_tests {
         client.remove_oracle(&admin, &oracle2);
         assert_eq!(client.get_oracles().len(), 1);
         assert_eq!(client.get_oracle_key(&oracle2), None);
+    }
+}
+
+// ============================================================
+// EVENT EMISSION TESTS
+// ============================================================
+#[cfg(test)]
+mod event_emission_tests {
+    use crate::{MarketFactory, MarketFactoryClient};
+    use boxmeout_shared::types::{FactoryConfig, FightDetails, MarketConfig};
+    use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, String, Vec};
+
+    fn setup() -> (Env, MarketFactoryClient<'static>) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, MarketFactory);
+        let client = MarketFactoryClient::new(&env, &contract_id);
+        (env, client)
+    }
+
+    fn default_config() -> FactoryConfig {
+        FactoryConfig {
+            default_min_bet: 1_000_000,
+            default_max_bet: 100_000_000_000,
+            default_fee_bps: 200,
+            default_lock_before_secs: 3600,
+            default_resolution_window: 86400,
+        }
+    }
+
+    fn sample_market_config(_env: &Env) -> MarketConfig {
+        MarketConfig {
+            min_bet_amount: 1_000_000,
+            max_bet: 100_000_000_000,
+            fee_bps: 200,
+            lock_before_secs: 3600,
+            resolution_window: 86400,
+            tier: 0,
+            dispute_cooldown_ledgers: 0,
+            token_decimals: 7,
+        }
+    }
+
+    fn init_factory(env: &Env, client: &MarketFactoryClient) {
+        let admin = Address::generate(env);
+        let treasury = Address::generate(env);
+        let oracle = Address::generate(env);
+        let oracle_raw_key: BytesN<32> = BytesN::from_array(env, &[1u8; 32]);
+        client.initialize(
+            &admin,
+            &treasury,
+            &oracle,
+            &oracle_raw_key,
+            &default_config(),
+        );
+    }
+
+    // ── factory_paused event ────────────────────────────────────
+
+    #[test]
+    fn test_pause_factory_emits_event() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let oracle_raw_key: BytesN<32> = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.initialize(
+            &admin,
+            &treasury,
+            &oracle,
+            &oracle_raw_key,
+            &default_config(),
+        );
+
+        // Pause factory
+        client.pause_factory(&admin);
+
+        // Verify event was emitted
+        let events = env.events().all();
+        assert!(
+            events.len() > 0,
+            "At least one event should be emitted (initialize + pause)"
+        );
+
+        // Last event should be factory_paused
+        let last_event = events.last().unwrap();
+        let topic_sym = soroban_sdk::Symbol::try_from_val(&env, &last_event.1.get(0).unwrap())
+            .unwrap();
+        assert_eq!(topic_sym, soroban_sdk::Symbol::new(&env, "factory_paused"));
+    }
+
+    // ── factory_unpaused event ──────────────────────────────────
+
+    #[test]
+    fn test_unpause_factory_emits_event() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let oracle_raw_key: BytesN<32> = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.initialize(
+            &admin,
+            &treasury,
+            &oracle,
+            &oracle_raw_key,
+            &default_config(),
+        );
+
+        client.pause_factory(&admin);
+        client.unpause_factory(&admin);
+
+        // Verify unpause event was emitted
+        let events = env.events().all();
+        assert!(events.len() > 1, "Multiple events should be emitted");
+
+        // Last event should be factory_unpaused
+        let last_event = events.last().unwrap();
+        let topic_sym = soroban_sdk::Symbol::try_from_val(&env, &last_event.1.get(0).unwrap())
+            .unwrap();
+        assert_eq!(topic_sym, soroban_sdk::Symbol::new(&env, "factory_unpaused"));
+    }
+
+    // ── default_config_updated event ────────────────────────────
+
+    #[test]
+    fn test_update_default_config_emits_event() {
+        let (env, client) = setup();
+        init_factory(&env, &client);
+
+        let mut new_config = sample_market_config(&env);
+        new_config.fee_bps = 300;
+
+        client.update_default_config(&Address::generate(&env), &new_config);
+
+        let events = env.events().all();
+        let last_event = events.last().unwrap();
+        let topic_sym = soroban_sdk::Symbol::try_from_val(&env, &last_event.1.get(0).unwrap())
+            .unwrap();
+        assert_eq!(
+            topic_sym,
+            soroban_sdk::Symbol::new(&env, "default_config_updated")
+        );
+    }
+
+    // ── oracle_added event ──────────────────────────────────────
+
+    #[test]
+    fn test_add_oracle_emits_event() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let oracle_raw_key: BytesN<32> = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.initialize(
+            &admin,
+            &treasury,
+            &oracle,
+            &oracle_raw_key,
+            &default_config(),
+        );
+
+        let new_oracle = Address::generate(&env);
+        let new_key: BytesN<32> = BytesN::from_array(&env, &[2u8; 32]);
+        client.add_oracle(&admin, &new_oracle, &new_key);
+
+        let events = env.events().all();
+        let last_event = events.last().unwrap();
+        let topic_sym = soroban_sdk::Symbol::try_from_val(&env, &last_event.1.get(0).unwrap())
+            .unwrap();
+        assert_eq!(topic_sym, soroban_sdk::Symbol::new(&env, "oracle_added"));
+    }
+
+    // ── oracle_removed event ────────────────────────────────────
+
+    #[test]
+    fn test_remove_oracle_emits_event() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let oracle_raw_key: BytesN<32> = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.initialize(
+            &admin,
+            &treasury,
+            &oracle,
+            &oracle_raw_key,
+            &default_config(),
+        );
+
+        client.remove_oracle(&admin, &oracle);
+
+        let events = env.events().all();
+        let last_event = events.last().unwrap();
+        let topic_sym = soroban_sdk::Symbol::try_from_val(&env, &last_event.1.get(0).unwrap())
+            .unwrap();
+        assert_eq!(topic_sym, soroban_sdk::Symbol::new(&env, "oracle_removed"));
+    }
+
+    // ── market_wasm_updated event ───────────────────────────────
+
+    #[test]
+    fn test_update_market_wasm_emits_event() {
+        let (env, client) = setup();
+        init_factory(&env, &client);
+
+        let admin = Address::generate(&env);
+        let new_hash: BytesN<32> = BytesN::from_array(&env, &[42u8; 32]);
+
+        client.update_market_wasm(&admin, &new_hash);
+
+        let events = env.events().all();
+        let last_event = events.last().unwrap();
+        let topic_sym = soroban_sdk::Symbol::try_from_val(&env, &last_event.1.get(0).unwrap())
+            .unwrap();
+        assert_eq!(
+            topic_sym,
+            soroban_sdk::Symbol::new(&env, "market_wasm_updated")
+        );
+    }
+
+    // ── admin_proposed event ────────────────────────────────────
+
+    #[test]
+    fn test_propose_admin_emits_event() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let oracle_raw_key: BytesN<32> = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.initialize(
+            &admin,
+            &treasury,
+            &oracle,
+            &oracle_raw_key,
+            &default_config(),
+        );
+
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&admin, &new_admin);
+
+        let events = env.events().all();
+        let last_event = events.last().unwrap();
+        let topic_sym = soroban_sdk::Symbol::try_from_val(&env, &last_event.1.get(0).unwrap())
+            .unwrap();
+        assert_eq!(topic_sym, soroban_sdk::Symbol::new(&env, "admin_proposed"));
+    }
+
+    // ── admin_transferred event ─────────────────────────────────
+
+    #[test]
+    fn test_accept_admin_emits_event() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let oracle_raw_key: BytesN<32> = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.initialize(
+            &admin,
+            &treasury,
+            &oracle,
+            &oracle_raw_key,
+            &default_config(),
+        );
+
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&admin, &new_admin);
+        client.accept_admin(&new_admin);
+
+        let events = env.events().all();
+        let last_event = events.last().unwrap();
+        let topic_sym = soroban_sdk::Symbol::try_from_val(&env, &last_event.1.get(0).unwrap())
+            .unwrap();
+        assert_eq!(
+            topic_sym,
+            soroban_sdk::Symbol::new(&env, "admin_transferred")
+        );
+    }
+
+    // ── market_created event ────────────────────────────────────
+
+    #[test]
+    fn test_create_market_emits_event() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let oracle_raw_key: BytesN<32> = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.initialize(
+            &admin,
+            &treasury,
+            &oracle,
+            &oracle_raw_key,
+            &default_config(),
+        );
+
+        // Set WASM hash
+        let wasm_hash: BytesN<32> = BytesN::from_array(&env, &[99u8; 32]);
+        client.update_market_wasm(&admin, &wasm_hash);
+
+        // Create market
+        let caller = Address::generate(&env);
+        let fight = FightDetails {
+            match_id: String::from_str(&env, "FURY-USYK-2025"),
+            fighter_a: String::from_str(&env, "Fury"),
+            fighter_b: String::from_str(&env, "Usyk"),
+            weight_class: String::from_str(&env, "Heavyweight"),
+            scheduled_at: env.ledger().timestamp() + 86400,
+            venue: String::from_str(&env, "Arena"),
+            title_fight: true,
+        };
+        client.create_market(&caller, &fight, &sample_market_config(&env), &None);
+
+        let events = env.events().all();
+        let has_market_created = events.iter().any(|ev| {
+            if let Ok(sym) =
+                soroban_sdk::Symbol::try_from_val(&env, &ev.1.get(0).unwrap())
+            {
+                sym == soroban_sdk::Symbol::new(&env, "market_created")
+            } else {
+                false
+            }
+        });
+        assert!(
+            has_market_created,
+            "market_created event should be emitted"
+        );
     }
 }
